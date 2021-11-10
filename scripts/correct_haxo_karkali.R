@@ -920,10 +920,32 @@ df6 %>% filter(!is.na(site)) -> df6
 old <- fread("data/haxo_data_corrected_2020.csv") %>% 
   mutate(datetime = with_tz(datetime, tzone = "Etc/GMT-2"))
 
-df7 <- bind_rows(old, df6) %>% 
+old2 <- data.table()
+for(i in unique(old$site)){
+  
+  old %>% filter(site == i) -> temp
+  
+  temp %>% mutate(grp = rleid(ifelse(is.na(at), 0, 1))) %>% 
+    group_by(grp) %>% 
+    summarise(n = n(),
+              val = mean(ifelse(is.na(at), 0, 1))) %>% 
+    mutate(cumn = cumsum(n)) -> grps
+  
+  if(tail(grps$val,1) == 0){
+    temp %>% slice(1:rev(grps$cumn)[2]) -> temp
+  }
+  
+  if(grps$val[1] == 0){
+    temp %>% slice(grps$cumn[1]+1:nrow(temp)) -> temp
+  }
+  
+  old2 <- bind_rows(old2, temp)
+}
+
+
+df7 <- bind_rows(old2, df6) %>% 
   arrange(site, datetime)
 
-df7 %>% filter(duplicated(df7 %>% select(site, datetime)))
 df7 %>% filter(!duplicated(df7 %>% select(site, datetime))) -> df7
 
 # Get rid of leading and trailing NAs
