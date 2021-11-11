@@ -914,16 +914,13 @@ for(i in unique(df5$site)){
 }
 
 df6 %>% filter(!is.na(site)) -> df6
-# fwrite(df6, "temp.csv")
-# Combine with previous year data
 
-old <- fread("data/haxo_data_corrected_2020.csv") %>% 
-  mutate(datetime = with_tz(datetime, tzone = "Etc/GMT-2"))
 
-old2 <- data.table()
-for(i in unique(old$site)){
+# Get rid of leading and trailing NAs
+df7 <- data.table()
+for(i in unique(df6$site)){
   
-  old %>% filter(site == i) -> temp
+  df6 %>% filter(site == i) -> temp
   
   temp %>% mutate(grp = rleid(ifelse(is.na(at), 0, 1))) %>% 
     group_by(grp) %>% 
@@ -939,14 +936,18 @@ for(i in unique(old$site)){
     temp %>% slice(grps$cumn[1]+1:nrow(temp)) -> temp
   }
   
-  old2 <- bind_rows(old2, temp)
+  df7 <- bind_rows(df7, temp)
 }
 
+# Combine with previous year data
 
-df7 <- bind_rows(old2, df6) %>% 
+old <- fread("data/haxo_data_corrected_2020.csv") %>% 
+  mutate(datetime = with_tz(datetime, tzone = "Etc/GMT-2"))
+
+df7 <- bind_rows(old, df7) %>% 
   arrange(site, datetime)
 
-df7 %>% filter(!duplicated(df7 %>% select(site, datetime))) -> df7
+df7 %>% filter(!duplicated(df7 %>% select(site, datetime), fromLast = T)) -> df7
 
 # Get rid of leading and trailing NAs
 df8 <- data.table()
@@ -971,21 +972,825 @@ for(i in unique(df7$site)){
   df8 <- bind_rows(df8, temp)
 }
 
+########################################################################
+# FILL MISSING TIMESTAMPS WITH NA
+df9 <- data.frame()
+for(i in unique(df8$site)){
+  #i <- 52
+  
+  df8 %>% filter(site == i) -> temp
+  
+  temp %>% mutate(timediff = as.numeric(datetime - lag(datetime))) -> temp
+  temp[1,"timediff"] <- 2
+  holes <- table(temp$timediff)
+  
+  if(max(temp$timediff, na.rm = T) > 2){
+    
+    print(i)
+    
+    missingt <- c()
+    for(ii in which(temp %>% pull(timediff) > 2)){
+      
+      temp %>% slice((ii-1):(ii+1)) %>% pull(timediff) -> diffs
+      
+      if(diffs[1] %% 2 == 0L){
+        seq(temp %>% slice(ii-1) %>% pull(datetime),
+            temp %>% slice(ii) %>% pull(datetime), by = "2 hours") -> seqs
+        
+        missingt <- c(missingt, 
+                      as.character(seqs[which(!seqs %in% (temp %>% slice((ii-1):(ii+1)) %>% pull(datetime)))]))
+        
+      } else {
+        print("WTF!!!!!!!!!!!!!!!!!!!!!!!!") 
+      }
+    }
+    
+    missingdf <- data.frame(datetime = ymd_hms(missingt),
+                            site = i)
+    
+    print(NROW(missingdf))
+    
+    temp %>% full_join(., missingdf) %>% 
+      arrange(datetime) %>% 
+      select(-timediff) -> temp
+    
+    df9 <- bind_rows(df9, temp)
+    
+  } else {
+    
+    temp %>% select(-timediff) -> temp
+    
+    df9 <- bind_rows(df9, temp)
+  }
+  
+}
+
+########################################################################
+# One more round of margin trimming
+# TRIM THE GAP MARGINS
+# BACKWARD
+
+df10 <- data.frame()
+for(i in unique(df9$site)){
+  # i <- 77
+  
+  print(i)
+  print(Sys.time())
+  
+  df9 %>% filter(site == i) %>% 
+    #select(-md, -md_arh) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(timediff = datetime - lag(datetime)) %>% 
+    full_join(., md) %>% 
+    arrange(datetime) %>% as.data.table() -> temp
+  
+  temp[1,"timediff"] <- 2
+  
+  splits <- which(temp$timediff > 4)
+  
+  if(length(splits) > 0){
+    for(ii in splits){
+      
+      temp %>% slice(1:(ii-1)) %>% pull(at) %>% rev() -> ats
+      
+      gap_length <- which.min(is.na(ats))-1
+      
+      test_df <- expand.grid(data_l = 11:167,
+                             move_l = 1:gap_length,
+                             cor = NA,
+                             abse = NA)
+      
+      test_df <- bind_rows(data.frame(data_l = 167,
+                                      move_l = 0,
+                                      cor = NA,
+                                      abse = NA),
+                           test_df)
+      
+      temp %>% slice(ii:(ii+167)) %>% pull(at) -> att
+      # temp %>% slice(ii:(ii+167)) %>% pull(md) -> mdt
+      # 
+      # test_df[1,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+      # test_df[1,"abse"] <- mean(abs(mdt-att), na.rm = T)
+      
+      maxl <- max(test_df$data_l)
+      
+      for(iii in 1:nrow(test_df)){
+        
+        if(test_df[iii,"data_l"] == maxl){
+          temp %>% slice((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"])) %>%
+            pull(md) -> mdt
+        } else {
+          temp %>% slice(c((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"]),
+                           (ii+test_df[iii,"data_l"]+1):(ii+167))) %>%
+            pull(md) -> mdt
+        }
+        
+        test_df[iii,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+        test_df[iii,"abse"] <- mean(abs(mdt-att), na.rm = T)
+        
+      }
+      
+      test_df %>% mutate(fac = (1-cor)*abse) %>% pull(fac) %>% which.min() -> result
+      
+      temp %>% pull(at) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$at <- ats
+      
+      temp %>% pull(arh) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$arh <- ats
+      
+    }
+  }
+  
+  temp$site <- i
+  
+  df10 <- bind_rows(df10, temp %>% select(site, datetime, at, arh, haxo_probl))
+  
+}
+
+df10 %>% filter(!is.na(site)) -> df10
+
+# fwrite(df4, "test.csv")
+# df4 <- fread("test.csv") %>% 
+#   mutate(datetime = with_tz(datetime, tzone = "Etc/GMT-2"))
+# FORWARD
+
+df11 <- data.frame()
+for(i in unique(df10$site)){
+  # i <- 55
+  
+  print(i)
+  print(Sys.time())
+  
+  df10 %>% filter(site == i) %>% 
+    #select(-md, -md_arh) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(timediff = lead(datetime) - datetime) %>% 
+    full_join(., md) %>% 
+    arrange(datetime) %>% as.data.table() -> temp
+  
+  splits <- which(temp$timediff > 4)
+  
+  if(length(splits) > 0){
+    for(ii in splits){
+      # ii <- 232
+      temp %>% slice((ii+1):nrow(.)) %>% pull(at) -> ats
+      
+      gap_length <- which.min(is.na(ats))-1
+      
+      if(gap_length > 3){
+        maxdata_l <- ifelse(gap_length < 83, gap_length, 83)
+        maxdata_l <- ifelse(ii-1 < maxdata_l, ii-1, maxdata_l)
+        
+        test_df <- expand.grid(data_l = 1:maxdata_l,
+                               move_l = 1:gap_length,
+                               cor = NA,
+                               abse = NA)
+        
+        test_df <- bind_rows(data.frame(data_l = maxdata_l,
+                                        move_l = 0,
+                                        cor = NA,
+                                        abse = NA),
+                             test_df)
+        
+        temp %>% slice((ii-maxdata_l):ii) %>% pull(at) -> att
+        # temp %>% slice(ii:(ii+167)) %>% pull(md) -> mdt
+        # 
+        # test_df[1,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+        # test_df[1,"abse"] <- mean(abs(mdt-att), na.rm = T)
+        
+        maxl <- max(test_df$data_l)
+        
+        for(iii in 1:nrow(test_df)){
+          
+          if(test_df[iii,"data_l"] == maxl){
+            temp %>% slice((ii-maxl+test_df[iii,"move_l"]):(ii+test_df[iii,"move_l"])) %>%
+              pull(md) -> mdt
+          } else {
+            temp %>% slice(c((ii-maxl):(ii-test_df[iii,"data_l"]),
+                             (ii-test_df[iii,"data_l"]+1+test_df[iii,"move_l"]):(ii+test_df[iii,"move_l"]))) %>%
+              pull(md) -> mdt
+          }
+          
+          test_df[iii,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+          test_df[iii,"abse"] <- mean(abs(mdt-att), na.rm = T)
+          
+        }
+        
+        test_df %>% mutate(fac = (1-cor)*abse) %>% pull(fac) %>% which.min() -> result
+        
+        temp %>% pull(at) -> ats
+        move <- ats[(ii-test_df[result,"data_l"]+1):ii]
+        ats[(ii-test_df[result,"data_l"]+1):ii] <- NA
+        ats[(ii-test_df[result,"data_l"]+1+test_df[result,"move_l"]):(ii+test_df[result,"move_l"])] <- move
+        temp$at <- ats
+        
+        temp %>% pull(arh) -> ats
+        move <- ats[(ii-test_df[result,"data_l"]+1):ii]
+        ats[(ii-test_df[result,"data_l"]+1):ii] <- NA
+        ats[(ii-test_df[result,"data_l"]+1+test_df[result,"move_l"]):(ii+test_df[result,"move_l"])] <- move
+        temp$arh <- ats
+        
+      }
+    }
+  }
+  
+  temp$site <- i
+  
+  df11 <- bind_rows(df11, temp %>% select(site, datetime, at, arh, haxo_probl, md))
+  
+}
+
+df11 %>% filter(!is.na(site)) -> df11
+
+# Select few to correct still
+
+to_correct <- c(15,17)
+
+df12 <- data.frame()
+for(i in unique(df11$site)){
+  # i <- 17
+  
+  print(i)
+  print(Sys.time())
+  
+  df11 %>% filter(site == i) %>% 
+    #select(-md, -md_arh) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(timediff = datetime - lag(datetime)) %>% 
+    full_join(., md) %>% 
+    arrange(datetime) %>% as.data.table() -> temp
+  
+  temp[1,"timediff"] <- 2
+  
+  splits <- which(temp$timediff > 4)
+  
+  if(length(splits) > 0 & i %in% to_correct){
+    for(ii in splits){
+      
+      temp %>% slice(1:(ii-1)) %>% pull(at) %>% rev() -> ats
+      
+      gap_length <- which.min(is.na(ats))-1
+      
+      test_df <- expand.grid(data_l = seq(11,167, by = 2),
+                             move_l = 1:gap_length,
+                             cor = NA,
+                             abse = NA)
+      
+      test_df <- bind_rows(data.frame(data_l = 167,
+                                      move_l = 0,
+                                      cor = NA,
+                                      abse = NA),
+                           test_df)
+      
+      temp %>% slice(ii:(ii+167)) %>% pull(at) -> att
+      # temp %>% slice(ii:(ii+167)) %>% pull(md) -> mdt
+      # 
+      # test_df[1,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+      # test_df[1,"abse"] <- mean(abs(mdt-att), na.rm = T)
+      
+      maxl <- max(test_df$data_l)
+      
+      for(iii in 1:nrow(test_df)){
+        
+        if(test_df[iii,"data_l"] == maxl){
+          temp %>% slice((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"])) %>%
+            pull(md) -> mdt
+        } else {
+          temp %>% slice(c((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"]),
+                           (ii+test_df[iii,"data_l"]+1):(ii+167))) %>%
+            pull(md) -> mdt
+        }
+        
+        test_df[iii,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+        test_df[iii,"abse"] <- mean(abs(mdt-att), na.rm = T)
+        
+      }
+      
+      test_df %>% mutate(fac = (1-cor)*abse) %>% pull(fac) %>% which.min() -> result
+      
+      temp %>% pull(at) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$at <- ats
+      
+      temp %>% pull(arh) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$arh <- ats
+      
+    }
+  }
+  
+  temp$site <- i
+  
+  df12 <- bind_rows(df12, temp %>% select(site, datetime, at, arh, haxo_probl))
+  
+}
+
+df12 %>% filter(!is.na(site)) -> df12
+
+# FORWARD
+to_correct <- c(15,17)
+
+df13 <- data.frame()
+for(i in unique(df12$site)){
+  # i <- 55
+  
+  print(i)
+  print(Sys.time())
+  
+  df12 %>% filter(site == i) %>% 
+    #select(-md, -md_arh) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(timediff = lead(datetime) - datetime) %>% 
+    full_join(., md) %>% 
+    arrange(datetime) %>% as.data.table() -> temp
+  
+  splits <- which(temp$timediff > 4)
+  
+  if(length(splits) > 0 & i %in% to_correct){
+    for(ii in splits){
+      # ii <- 232
+      temp %>% slice((ii+1):nrow(.)) %>% pull(at) -> ats
+      
+      gap_length <- which.min(is.na(ats))-1
+      
+      if(gap_length > 3){
+        maxdata_l <- ifelse(gap_length < 83, gap_length, 83)
+        maxdata_l <- ifelse(ii-1 < maxdata_l, ii-1, maxdata_l)
+        
+        test_df <- expand.grid(data_l = 1:maxdata_l,
+                               move_l = 1:gap_length,
+                               cor = NA,
+                               abse = NA)
+        
+        test_df <- bind_rows(data.frame(data_l = maxdata_l,
+                                        move_l = 0,
+                                        cor = NA,
+                                        abse = NA),
+                             test_df)
+        
+        temp %>% slice((ii-maxdata_l):ii) %>% pull(at) -> att
+        # temp %>% slice(ii:(ii+167)) %>% pull(md) -> mdt
+        # 
+        # test_df[1,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+        # test_df[1,"abse"] <- mean(abs(mdt-att), na.rm = T)
+        
+        maxl <- max(test_df$data_l)
+        
+        for(iii in 1:nrow(test_df)){
+          
+          if(test_df[iii,"data_l"] == maxl){
+            temp %>% slice((ii-maxl+test_df[iii,"move_l"]):(ii+test_df[iii,"move_l"])) %>%
+              pull(md) -> mdt
+          } else {
+            temp %>% slice(c((ii-maxl):(ii-test_df[iii,"data_l"]),
+                             (ii-test_df[iii,"data_l"]+1+test_df[iii,"move_l"]):(ii+test_df[iii,"move_l"]))) %>%
+              pull(md) -> mdt
+          }
+          
+          test_df[iii,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+          test_df[iii,"abse"] <- mean(abs(mdt-att), na.rm = T)
+          
+        }
+        
+        test_df %>% mutate(fac = (1-cor)*abse) %>% pull(fac) %>% which.min() -> result
+        
+        temp %>% pull(at) -> ats
+        move <- ats[(ii-test_df[result,"data_l"]+1):ii]
+        ats[(ii-test_df[result,"data_l"]+1):ii] <- NA
+        ats[(ii-test_df[result,"data_l"]+1+test_df[result,"move_l"]):(ii+test_df[result,"move_l"])] <- move
+        temp$at <- ats
+        
+        temp %>% pull(arh) -> ats
+        move <- ats[(ii-test_df[result,"data_l"]+1):ii]
+        ats[(ii-test_df[result,"data_l"]+1):ii] <- NA
+        ats[(ii-test_df[result,"data_l"]+1+test_df[result,"move_l"]):(ii+test_df[result,"move_l"])] <- move
+        temp$arh <- ats
+        
+      }
+    }
+  }
+  
+  temp$site <- i
+  
+  df13 <- bind_rows(df13, temp %>% select(site, datetime, at, arh, haxo_probl, md))
+  
+}
+
+df13 %>% filter(!is.na(site)) -> df13
+
+#
+# Select few to correct still
+# Backward
+
+to_correct <- c(15)
+
+df14 <- data.frame()
+for(i in unique(df13$site)){
+  # i <- 17
+  
+  print(i)
+  print(Sys.time())
+  
+  df13 %>% filter(site == i) %>% 
+    #select(-md, -md_arh) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(timediff = datetime - lag(datetime)) %>% 
+    full_join(., md) %>% 
+    arrange(datetime) %>% as.data.table() -> temp
+  
+  temp[1,"timediff"] <- 2
+  
+  splits <- which(temp$timediff > 4)
+  
+  if(length(splits) > 0 & i %in% to_correct){
+    for(ii in splits){
+      
+      temp %>% slice(1:(ii-1)) %>% pull(at) %>% rev() -> ats
+      
+      gap_length <- which.min(is.na(ats))-1
+      
+      test_df <- expand.grid(data_l = seq(11,167, by = 2),
+                             move_l = 1:gap_length,
+                             cor = NA,
+                             abse = NA)
+      
+      test_df <- bind_rows(data.frame(data_l = 167,
+                                      move_l = 0,
+                                      cor = NA,
+                                      abse = NA),
+                           test_df)
+      
+      temp %>% slice(ii:(ii+167)) %>% pull(at) -> att
+      # temp %>% slice(ii:(ii+167)) %>% pull(md) -> mdt
+      # 
+      # test_df[1,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+      # test_df[1,"abse"] <- mean(abs(mdt-att), na.rm = T)
+      
+      maxl <- max(test_df$data_l)
+      
+      for(iii in 1:nrow(test_df)){
+        
+        if(test_df[iii,"data_l"] == maxl){
+          temp %>% slice((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"])) %>%
+            pull(md) -> mdt
+        } else {
+          temp %>% slice(c((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"]),
+                           (ii+test_df[iii,"data_l"]+1):(ii+167))) %>%
+            pull(md) -> mdt
+        }
+        
+        test_df[iii,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+        test_df[iii,"abse"] <- mean(abs(mdt-att), na.rm = T)
+        
+      }
+      
+      test_df %>% mutate(fac = (1-cor)*abse) %>% pull(fac) %>% which.min() -> result
+      
+      temp %>% pull(at) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$at <- ats
+      
+      temp %>% pull(arh) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$arh <- ats
+      
+    }
+  }
+  
+  temp$site <- i
+  
+  df14 <- bind_rows(df14, temp %>% select(site, datetime, at, arh, haxo_probl))
+  
+}
+
+df14 %>% filter(!is.na(site)) -> df14
+
+#
+# Select few to correct still
+# Backward
+
+to_correct <- c(15)
+
+df15 <- data.frame()
+for(i in unique(df14$site)){
+  # i <- 17
+  
+  print(i)
+  print(Sys.time())
+  
+  df14 %>% filter(site == i) %>% 
+    #select(-md, -md_arh) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(timediff = datetime - lag(datetime)) %>% 
+    full_join(., md) %>% 
+    arrange(datetime) %>% as.data.table() -> temp
+  
+  temp[1,"timediff"] <- 2
+  
+  splits <- which(temp$timediff > 4)
+  
+  if(length(splits) > 0 & i %in% to_correct){
+    for(ii in splits){
+      
+      temp %>% slice(1:(ii-1)) %>% pull(at) %>% rev() -> ats
+      
+      gap_length <- which.min(is.na(ats))-1
+      
+      test_df <- expand.grid(data_l = seq(11,167, by = 2),
+                             move_l = 1:gap_length,
+                             cor = NA,
+                             abse = NA)
+      
+      test_df <- bind_rows(data.frame(data_l = 167,
+                                      move_l = 0,
+                                      cor = NA,
+                                      abse = NA),
+                           test_df)
+      
+      temp %>% slice(ii:(ii+167)) %>% pull(at) -> att
+      # temp %>% slice(ii:(ii+167)) %>% pull(md) -> mdt
+      # 
+      # test_df[1,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+      # test_df[1,"abse"] <- mean(abs(mdt-att), na.rm = T)
+      
+      maxl <- max(test_df$data_l)
+      
+      for(iii in 1:nrow(test_df)){
+        
+        if(test_df[iii,"data_l"] == maxl){
+          temp %>% slice((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"])) %>%
+            pull(md) -> mdt
+        } else {
+          temp %>% slice(c((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"]),
+                           (ii+test_df[iii,"data_l"]+1):(ii+167))) %>%
+            pull(md) -> mdt
+        }
+        
+        test_df[iii,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+        test_df[iii,"abse"] <- mean(abs(mdt-att), na.rm = T)
+        
+      }
+      
+      test_df %>% mutate(fac = (1-cor)*abse) %>% pull(fac) %>% which.min() -> result
+      
+      temp %>% pull(at) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$at <- ats
+      
+      temp %>% pull(arh) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$arh <- ats
+      
+    }
+  }
+  
+  temp$site <- i
+  
+  df15 <- bind_rows(df15, temp %>% select(site, datetime, at, arh, haxo_probl))
+  
+}
+
+df15 %>% filter(!is.na(site)) -> df15
+
+#
+# Select few to correct still
+# Backward
+
+to_correct <- c(15)
+
+df16 <- data.frame()
+for(i in unique(df15$site)){
+  # i <- 17
+  
+  print(i)
+  print(Sys.time())
+  
+  df15 %>% filter(site == i) %>% 
+    #select(-md, -md_arh) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(timediff = datetime - lag(datetime)) %>% 
+    full_join(., md) %>% 
+    arrange(datetime) %>% as.data.table() -> temp
+  
+  temp[1,"timediff"] <- 2
+  
+  splits <- which(temp$timediff > 4)
+  
+  if(length(splits) > 0 & i %in% to_correct){
+    for(ii in splits){
+      
+      temp %>% slice(1:(ii-1)) %>% pull(at) %>% rev() -> ats
+      
+      gap_length <- which.min(is.na(ats))-1
+      
+      test_df <- expand.grid(data_l = seq(11,167, by = 2),
+                             move_l = 1:gap_length,
+                             cor = NA,
+                             abse = NA)
+      
+      test_df <- bind_rows(data.frame(data_l = 167,
+                                      move_l = 0,
+                                      cor = NA,
+                                      abse = NA),
+                           test_df)
+      
+      temp %>% slice(ii:(ii+167)) %>% pull(at) -> att
+      # temp %>% slice(ii:(ii+167)) %>% pull(md) -> mdt
+      # 
+      # test_df[1,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+      # test_df[1,"abse"] <- mean(abs(mdt-att), na.rm = T)
+      
+      maxl <- max(test_df$data_l)
+      
+      for(iii in 1:nrow(test_df)){
+        
+        if(test_df[iii,"data_l"] == maxl){
+          temp %>% slice((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"])) %>%
+            pull(md) -> mdt
+        } else {
+          temp %>% slice(c((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"]),
+                           (ii+test_df[iii,"data_l"]+1):(ii+167))) %>%
+            pull(md) -> mdt
+        }
+        
+        test_df[iii,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+        test_df[iii,"abse"] <- mean(abs(mdt-att), na.rm = T)
+        
+      }
+      
+      test_df %>% mutate(fac = (1-cor)*abse) %>% pull(fac) %>% which.min() -> result
+      
+      temp %>% pull(at) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$at <- ats
+      
+      temp %>% pull(arh) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$arh <- ats
+      
+    }
+  }
+  
+  temp$site <- i
+  
+  df16 <- bind_rows(df16, temp %>% select(site, datetime, at, arh, haxo_probl))
+  
+}
+
+df16 %>% filter(!is.na(site)) -> df16
+
+#
+# Select few to correct still
+# Backward
+
+to_correct <- c(15)
+
+df17 <- data.frame()
+for(i in unique(df16$site)){
+  # i <- 17
+  
+  print(i)
+  print(Sys.time())
+  
+  df16 %>% filter(site == i) %>% 
+    #select(-md, -md_arh) %>% 
+    filter(complete.cases(.)) %>% 
+    mutate(timediff = datetime - lag(datetime)) %>% 
+    full_join(., md) %>% 
+    arrange(datetime) %>% as.data.table() -> temp
+  
+  temp[1,"timediff"] <- 2
+  
+  splits <- which(temp$timediff > 4)
+  
+  if(length(splits) > 0 & i %in% to_correct){
+    for(ii in splits){
+      
+      temp %>% slice(1:(ii-1)) %>% pull(at) %>% rev() -> ats
+      
+      gap_length <- which.min(is.na(ats))-1
+      
+      test_df <- expand.grid(data_l = seq(11,167, by = 2),
+                             move_l = 1:gap_length,
+                             cor = NA,
+                             abse = NA)
+      
+      test_df <- bind_rows(data.frame(data_l = 167,
+                                      move_l = 0,
+                                      cor = NA,
+                                      abse = NA),
+                           test_df)
+      
+      temp %>% slice(ii:(ii+167)) %>% pull(at) -> att
+      # temp %>% slice(ii:(ii+167)) %>% pull(md) -> mdt
+      # 
+      # test_df[1,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+      # test_df[1,"abse"] <- mean(abs(mdt-att), na.rm = T)
+      
+      maxl <- max(test_df$data_l)
+      
+      for(iii in 1:nrow(test_df)){
+        
+        if(test_df[iii,"data_l"] == maxl){
+          temp %>% slice((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"])) %>%
+            pull(md) -> mdt
+        } else {
+          temp %>% slice(c((ii-test_df[iii,"move_l"]):(ii-test_df[iii,"move_l"]+test_df[iii,"data_l"]),
+                           (ii+test_df[iii,"data_l"]+1):(ii+167))) %>%
+            pull(md) -> mdt
+        }
+        
+        test_df[iii,"cor"] <- cor(mdt, att, use = "pairwise.complete.obs")
+        test_df[iii,"abse"] <- mean(abs(mdt-att), na.rm = T)
+        
+      }
+      
+      test_df %>% mutate(fac = (1-cor)*abse) %>% pull(fac) %>% which.min() -> result
+      
+      temp %>% pull(at) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$at <- ats
+      
+      temp %>% pull(arh) -> ats
+      move <- ats[ii:(ii+test_df[result,"data_l"])]
+      ats[ii:(ii+test_df[result,"data_l"])] <- NA
+      ats[(ii-test_df[result,"move_l"]):(ii-test_df[result,"move_l"]+test_df[result,"data_l"])] <- move
+      temp$arh <- ats
+      
+    }
+  }
+  
+  temp$site <- i
+  
+  df17 <- bind_rows(df17, temp %>% select(site, datetime, at, arh, haxo_probl))
+  
+}
+
+df17 %>% filter(!is.na(site)) -> df17
+
+
+# Get rid of leading and trailing NAs
+df18 <- data.table()
+for(i in unique(df17$site)){
+  
+  df17 %>% filter(site == i) -> temp
+  
+  temp %>% mutate(grp = rleid(ifelse(is.na(at), 0, 1))) %>% 
+    group_by(grp) %>% 
+    summarise(n = n(),
+              val = mean(ifelse(is.na(at), 0, 1))) %>% 
+    mutate(cumn = cumsum(n)) -> grps
+  
+  if(tail(grps$val,1) == 0){
+    temp %>% slice(1:rev(grps$cumn)[2]) -> temp
+  }
+  
+  if(grps$val[1] == 0){
+    temp %>% slice(grps$cumn[1]+1:nrow(temp)) -> temp
+  }
+  
+  df18 <- bind_rows(df18, temp)
+}
+
 
 # PLOT
 
-df8 %>% filter(haxo_probl == 0) %>% 
+df18 %>% filter(haxo_probl == 0) %>% 
   group_by(datetime) %>% 
   summarise(md = median(at, na.rm = T),
             md_arh = median(arh, na.rm = T)) %>% 
   ungroup() -> md
 
 pdf("visuals/Haxo_corrected_combined.pdf", 12, 8)
-for(i in unique(df8$site)){
+for(i in unique(df18$site)){
   # i <- 53
   print(i)
   
-  df8 %>% filter(site == i) %>% 
+  df18 %>% filter(site == i) %>% 
     left_join(., md) -> temp
   
   temp %>% ggplot(aes_string(x="datetime")) +
@@ -1010,5 +1815,4 @@ for(i in unique(df8$site)){
 dev.off()
 
 
-fwrite(df8, "output/haxo_data_corrected.csv")
-
+fwrite(df18, "output/haxo_data_corrected.csv")
